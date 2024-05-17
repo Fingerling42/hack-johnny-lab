@@ -1,4 +1,5 @@
 import math
+import yaml
 
 import rclpy
 from rclpy.action import ActionClient
@@ -7,12 +8,15 @@ from typing_extensions import Self, Any, Optional
 
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
+from rcl_interfaces.msg import ParameterDescriptor
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import DockStatus
 from action_msgs.msg import GoalStatus
 
-from rclpy.qos import qos_profile_sensor_data
+from turtlebot4_navigation.turtlebot4_navigator import TurtleBot4Directions
+
+from rclpy.qos import qos_profile_sensor_data, qos_profile_system_default
 
 from rclpy.executors import MultiThreadedExecutor
 
@@ -20,6 +24,24 @@ from rclpy.executors import MultiThreadedExecutor
 class JohnnyLabNavigator(Node):
     def __init__(self) -> None:
         super().__init__('johnny_lab_navigator')
+
+        # Declare used parameters
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('navigator_params_path',
+                 rclpy.Parameter.Type.STRING,
+                 ParameterDescriptor(description='Path to config file with parameters')),
+            ]
+        )
+
+        navigator_params_path = self.get_parameter('navigator_params_path').value
+        with open(navigator_params_path, 'r') as navigator_config_file:
+            navigator_params_dict = yaml.load(navigator_config_file, Loader=yaml.SafeLoader)
+
+        # Load all params
+        self.init_position = navigator_params_dict['init_position']
+        self.init_rotation = navigator_params_dict['init_rotation']
 
         self.publisher_initial_pose = None
         self.undock_action_client = None
@@ -43,15 +65,18 @@ class JohnnyLabNavigator(Node):
 
         callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.initial_pose = self.get_pose_stamped(
-            [0.0, 0.0],
-            171.8)
+        try:
+            self.initial_pose = self.get_pose_stamped(
+                self.init_position,
+                self.init_rotation * 180 / math.pi)
+        except Exception as e:
+            self.get_logger().error('Error: %s' % str(e))
 
-        self.publisher_initial_pose = self.create_lifecycle_publisher(
+        self.publisher_initial_pose = self.create_publisher(
             PoseWithCovarianceStamped,
             'initialpose',
-            10,
-            callback_group=callback_group
+            qos_profile=qos_profile_system_default,
+            callback_group=callback_group,
         )
 
         self.subscriber_dock_status = self.create_subscription(

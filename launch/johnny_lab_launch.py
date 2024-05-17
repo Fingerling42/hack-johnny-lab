@@ -4,7 +4,7 @@ from launch_ros.actions import Node
 import os
 from ament_index_python.packages import get_package_share_directory
 
-from launch.actions import IncludeLaunchDescription
+from launch.actions import IncludeLaunchDescription, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 
@@ -30,7 +30,6 @@ def generate_launch_description():
             '/localization.launch.py']),
         launch_arguments={
             'params': config_localization,
-            'log_level': 'error',
         }.items()
     )
 
@@ -43,7 +42,12 @@ def generate_launch_description():
         }.items()
     )
 
+    nav2_timer = TimerAction(
+        period=20.0,
+        actions=[turtlebot4_navigation]
+    )
+
     return LaunchDescription([
         turtlebot4_localization,
-        turtlebot4_navigation
+        nav2_timer
     ])
