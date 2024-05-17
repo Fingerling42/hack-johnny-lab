@@ -21,11 +21,15 @@ class JohnnyLabNavigator(Node):
     def __init__(self) -> None:
         super().__init__('johnny_lab_navigator')
 
-        self.initial_pose = None
-        self.initial_pose_pub = None
-        self.is_docked = None
-        self.undock_client = None
+        self.publisher_initial_pose = None
+        self.undock_action_client = None
+        self.dock_action_client = None
+        self.subscriber_dock_status = None
+
         self.action_status_undock = None
+        self.action_status_dock = None
+        self.is_docked = None
+        self.initial_pose = None
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """
@@ -37,29 +41,38 @@ class JohnnyLabNavigator(Node):
 
         self.get_logger().info('Configuring navigator')
 
-        start_callback_group = MutuallyExclusiveCallbackGroup()
+        callback_group = MutuallyExclusiveCallbackGroup()
 
         self.initial_pose = self.get_pose_stamped(
             [0.0, 0.0],
             171.8)
 
-        self.initial_pose_pub = self.create_publisher(
+        self.publisher_initial_pose = self.create_lifecycle_publisher(
             PoseWithCovarianceStamped,
             'initialpose',
             10,
-            callback_group=start_callback_group
+            callback_group=callback_group
         )
 
-        self.create_subscription(DockStatus,
-                                 'dock_status',
-                                 self.dock_status_callback,
-                                 qos_profile_sensor_data)
+        self.subscriber_dock_status = self.create_subscription(
+            DockStatus,
+            'dock_status',
+            self.dock_status_callback,
+            qos_profile_sensor_data
+        )
 
-        self.undock_client = ActionClient(
+        self.undock_action_client = ActionClient(
             self,
             Undock,
             'undock',
-            callback_group=start_callback_group
+            callback_group=callback_group
+        )
+
+        self.dock_action_client = ActionClient(
+            self,
+            Dock,
+            'dock',
+            callback_group=callback_group
         )
 
         self.get_logger().info('Configuring is done')
@@ -72,20 +85,38 @@ class JohnnyLabNavigator(Node):
         # For that reason, we only need to write an on_configure() and on_cleanup() callbacks, and we don't
         # need to write on_activate()/on_deactivate() callbacks.
 
-        # Log, only for demo purposes
         self.get_logger().info('Navigator in active state')
 
+        # Wait for dock status
+        while self.is_docked is None:
+            pass
+
         # Undock if docked
-        if self.get_dock_status() is True:
+        if self.is_docked is True:
             self.send_goal_undock()
             while self.action_status_undock != GoalStatus.STATUS_SUCCEEDED:
-                self.executor.spin_once(timeout_sec=0.1)
-        self.action_status_undock = None
+                if self.action_status_undock == GoalStatus.STATUS_ABORTED:
+                    self.action_status_undock = None
+                    self.send_goal_undock()
+                pass
 
         # Set the initial pose
         self.set_initial_pose(self.initial_pose)
 
         return super().on_activate(state)
+
+    def on_deactivate(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info('Navigator in deactivate state')
+
+        # Dock the robot, until success
+        self.send_goal_dock()
+        while self.action_status_dock != GoalStatus.STATUS_SUCCEEDED:
+            if self.action_status_dock == GoalStatus.STATUS_ABORTED:
+                self.action_status_dock = None
+                self.send_goal_dock()
+            pass
+
+        return super().on_deactivate(state)
 
     def on_cleanup(self, state: State) -> TransitionCallbackReturn:
         """
@@ -94,6 +125,17 @@ class JohnnyLabNavigator(Node):
         :return: The state machine either invokes a transition to the "finalized" state or stays
         in the current state depending on the return value.
         """
+        self.get_logger().warn('Cleaning up navigator state')
+
+        self.destroy_publisher(self.publisher_initial_pose)
+        self.destroy_client(self.undock_action_client)
+        self.destroy_client(self.dock_action_client)
+        self.destroy_subscription(self.subscriber_dock_status)
+
+        self.is_docked = None
+        self.action_status_undock = None
+        self.action_status_dock = None
+
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state: State) -> TransitionCallbackReturn:
@@ -103,6 +145,8 @@ class JohnnyLabNavigator(Node):
         :return: The state machine either invokes a transition to the "finalized" state or stays
         in the current state depending on the return value.
         """
+        self.get_logger().warn('Destroying the navigator')
+
         return TransitionCallbackReturn.SUCCESS
 
     def __enter__(self) -> Self:
@@ -149,23 +193,11 @@ class JohnnyLabNavigator(Node):
         msg.header.frame_id = initial_pose.header.frame_id
         msg.header.stamp = initial_pose.header.stamp
         self.get_logger().info('Publishing initial pose')
-        self.initial_pose_pub.publish(msg)
+
+        self.publisher_initial_pose.publish(msg)
 
     def dock_status_callback(self, msg: DockStatus):
         self.is_docked = msg.is_docked
-
-    def get_dock_status(self):
-        """
-        Get current docked status.
-        :return: ``True`` if docked, ``False`` otherwise.
-        """
-        # Spin to get latest dock status
-        self.executor.spin_once(timeout_sec=0.1)
-        # If dock status hasn't been published yet, spin until it is
-        while self.is_docked is None:
-            self.executor.spin_once(timeout_sec=0.1)
-
-        return self.is_docked
 
     def send_goal_undock(self):
         """
@@ -173,8 +205,8 @@ class JohnnyLabNavigator(Node):
         :return: None
         """
         goal_msg = Undock.Goal()
-        self.undock_client.wait_for_server()
-        send_goal_future = self.undock_client.send_goal_async(goal_msg)
+        self.undock_action_client.wait_for_server()
+        send_goal_future = self.undock_action_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.undock_response_callback)
 
     def undock_response_callback(self, future):
@@ -190,7 +222,44 @@ class JohnnyLabNavigator(Node):
         get_result_future.add_done_callback(self.undock_result_callback)
 
     def undock_result_callback(self, future):
-        self.action_status_undock = GoalStatus.STATUS_SUCCEEDED
+        result = future.result().result.is_docked
+        if result is False:
+            self.get_logger().info('Undocking is done')
+            self.action_status_undock = GoalStatus.STATUS_SUCCEEDED
+        else:
+            self.get_logger().warn('Undocking is failed, trying again')
+            self.action_status_undock = GoalStatus.STATUS_ABORTED
+
+    def send_goal_dock(self):
+        """
+        A function for sending goal to dock action
+        :return: None
+        """
+        goal_msg = Dock.Goal()
+        self.dock_action_client.wait_for_server()
+        send_goal_future = self.dock_action_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self.dock_response_callback)
+
+    def dock_response_callback(self, future):
+        # Checking that goal is accepted
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Cannot dock, please check')
+            return
+        self.get_logger().info('Going to dock robot to station')
+
+        # Waiting for finishing the goal to proceed for its result
+        get_result_future = goal_handle.get_result_async()
+        get_result_future.add_done_callback(self.dock_result_callback)
+
+    def dock_result_callback(self, future):
+        result = future.result().result.is_docked
+        if result is True:
+            self.get_logger().info('Docking is done')
+            self.action_status_dock = GoalStatus.STATUS_SUCCEEDED
+        else:
+            self.get_logger().warn('Docking is failed, trying again')
+            self.action_status_dock = GoalStatus.STATUS_ABORTED
 
 
 def main(args=None) -> None:
