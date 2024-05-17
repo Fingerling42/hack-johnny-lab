@@ -4,7 +4,7 @@
   <name>turtlebot4_johnny_lab</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="bermanivan42@gmail.com">harzroller</maintainer>
+  <maintainer email="fingerling42@proton.me">Ivan Berman</maintainer>
   <license>TODO: License declaration</license>
 
   <test_depend>ament_copyright</test_depend>
