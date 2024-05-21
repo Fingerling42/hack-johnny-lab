@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'johnny_lab_navigator = turtlebot4_johnny_lab.johnny_lab_navigator:main',
+            'johnny_lab_robonomics = turtlebot4_johnny_lab.johnny_lab_robonomics:main',
         ],
     },
 )
