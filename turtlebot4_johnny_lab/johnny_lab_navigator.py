@@ -1,5 +1,7 @@
 import math
 import yaml
+import os
+import random
 
 import rclpy
 from rclpy.action import ActionClient
@@ -33,17 +35,44 @@ class JohnnyLabNavigator(Node):
                 ('navigator_params_path',
                  rclpy.Parameter.Type.STRING,
                  ParameterDescriptor(description='Path to config file with parameters')),
+                ('seeds_file_path',
+                 rclpy.Parameter.Type.STRING,
+                 ParameterDescriptor(description='Path to file that contains all seeds')),
             ]
         )
 
+        # Open navigator param file and load all coordinates
         navigator_params_path = self.get_parameter('navigator_params_path').value
         with open(navigator_params_path, 'r') as navigator_config_file:
             navigator_params_dict = yaml.load(navigator_config_file, Loader=yaml.SafeLoader)
 
-        # Load all params
-        self.init_position = navigator_params_dict['init']['position']
-        self.init_rotation = navigator_params_dict['init']['rotation']
+        # Get initial pose
+        try:
+            self.initial_pose = self.get_pose_stamped(
+                navigator_params_dict['init']['position'],
+                navigator_params_dict['init']['rotation'] * 180 / math.pi)
+        except Exception as e:
+            self.get_logger().error('Error: %s' % str(e))
 
+        # Get goal poses for path and put it to list of dicts
+        self.goal_poses = []
+        for point in navigator_params_dict['points']:
+            try:
+                pose = self.get_pose_stamped(
+                    navigator_params_dict['points'][point]['position'],
+                    navigator_params_dict['points'][point]['rotation'] * 180 / math.pi)
+                pose_dict = {
+                    'label':    str(point),
+                    'pose':     pose,
+                }
+                self.goal_poses.append(pose_dict)
+            except Exception as e:
+                self.get_logger().error('Error in getting goal poses: %s' % str(e))
+
+        # Open file with all seeds
+        self.seeds_file_path = self.get_parameter('seeds_file_path').value
+
+        # Variable init
         self.publisher_initial_pose = None
         self.undock_action_client = None
         self.dock_action_client = None
@@ -56,6 +85,7 @@ class JohnnyLabNavigator(Node):
         self.is_docked = None
         self.initial_pose = None
         self.action_feedback = None
+        self.goal_random_poses_words = None
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """
@@ -67,14 +97,25 @@ class JohnnyLabNavigator(Node):
 
         self.get_logger().info('Configuring navigator')
 
-        main_callback_group = MutuallyExclusiveCallbackGroup()
+        #  Getting seed phrase and its words
+        with open(self.seeds_file_path, 'r') as seeds_file:
+            seed_phrase = seeds_file.readline()
+            with open(self.seeds_file_path + '_temp', 'w') as temp_file:
+                for line in seeds_file:
+                    temp_file.write(line)
 
-        try:
-            self.initial_pose = self.get_pose_stamped(
-                self.init_position,
-                self.init_rotation * 180 / math.pi)
-        except Exception as e:
-            self.get_logger().error('Error: %s' % str(e))
+        seed_phrase = seed_phrase.strip()
+        seed_words = list(seed_phrase.split(' '))
+
+        # Add seed words to new list with goal poses dicts
+        self.goal_random_poses_words = self.goal_poses.copy()
+        for i in range(0, len(seed_words)):
+            self.goal_random_poses_words[i].update({'word': seed_words[i]})
+
+        # Randomize poses with words
+        random.shuffle(self.goal_random_poses_words)
+
+        main_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.publisher_initial_pose = self.create_publisher(
             PoseWithCovarianceStamped,
@@ -163,14 +204,28 @@ class JohnnyLabNavigator(Node):
         """
         self.get_logger().warn('Cleaning up navigator state')
 
+        # Rewrite seed file without first seed and remove temp file
+        with open(self.seeds_file_path + '_temp', 'r') as temp_file:
+            with open(self.seeds_file_path, 'w') as seeds_file:
+                for line in temp_file:
+                    seeds_file.write(line)
+
+        os.remove(self.seeds_file_path + '_temp')
+
+        # Destroy ROS entities
         self.destroy_publisher(self.publisher_initial_pose)
         self.destroy_client(self.undock_action_client)
         self.destroy_client(self.dock_action_client)
+        self.destroy_client(self.nav_to_pose_action_client)
         self.destroy_subscription(self.subscriber_dock_status)
 
-        self.is_docked = None
+        # Clear variables
         self.action_status_undock = None
         self.action_status_dock = None
+        self.action_status_nav_to_pose = None
+        self.is_docked = None
+        self.action_feedback = None
+        self.goal_random_poses_words = None
 
         return TransitionCallbackReturn.SUCCESS
 
@@ -318,7 +373,7 @@ class JohnnyLabNavigator(Node):
         send_goal_future = self.nav_to_pose_action_client.send_goal_async(goal_msg, self.action_feedback_callback)
         send_goal_future.add_done_callback(self.nav_to_pose_response_callback)
 
-    def nav_to_pose_response_callback(self,future):
+    def nav_to_pose_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warn('Goal to was rejected!')
