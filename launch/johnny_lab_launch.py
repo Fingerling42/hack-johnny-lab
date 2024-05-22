@@ -12,13 +12,20 @@ from launch.substitutions import LaunchConfiguration
 launch_args = [
     DeclareLaunchArgument(
         name='pubsub_params_path',
-        description='Path to config file with parameters',
-        default_value=''
+        description='Path to pubsub config file with parameters',
+    ),
+    DeclareLaunchArgument(
+        name='navigator_params_path',
+        description='Path to navigator config file with parameters',
     ),
     DeclareLaunchArgument(
         name='namespace',
         description='Robot namespace',
         default_value=''
+    ),
+    DeclareLaunchArgument(
+        name='seeds_file_path',
+        description='Path to file that contains all seeds',
     ),
 ]
 
@@ -49,10 +56,22 @@ def generate_launch_description():
         }],
     )
 
-    # Robonomics handler for your robot
+    # Robonomics handler for Johnny Lab
     johnny_lab_robonomics = Node(
-       package='turtlebot4_johnny_lab',
-       executable='johnny_lab_robonomics',
+        package='turtlebot4_johnny_lab',
+        executable='johnny_lab_robonomics',
+        emulate_tty=True,
+    )
+
+    # Navigator node for Johnny Lab
+    johnny_lab_navigator = Node(
+        package='turtlebot4_johnny_lab',
+        executable='johnny_lab_navigator',
+        emulate_tty=True,
+        parameters=[{
+            'navigator_params_path': LaunchConfiguration('navigator_params_path'),
+            'seeds_file_path': LaunchConfiguration('seeds_file_path'),
+        }],
     )
 
     namespace_launch_action = GroupAction(
@@ -90,5 +109,6 @@ def generate_launch_description():
     # ld.add_action(turtlebot4_localization)
     # ld.add_action(nav2_timer)
     ld.add_action(namespace_launch_action)
+    ld.add_action(johnny_lab_navigator)
 
     return ld

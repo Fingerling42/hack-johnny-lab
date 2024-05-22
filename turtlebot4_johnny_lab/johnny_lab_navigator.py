@@ -34,7 +34,7 @@ class JohnnyLabNavigator(Node):
             parameters=[
                 ('navigator_params_path',
                  rclpy.Parameter.Type.STRING,
-                 ParameterDescriptor(description='Path to config file with parameters')),
+                 ParameterDescriptor(description='Path to navigator config file with parameters')),
                 ('seeds_file_path',
                  rclpy.Parameter.Type.STRING,
                  ParameterDescriptor(description='Path to file that contains all seeds')),

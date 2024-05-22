@@ -3,6 +3,7 @@ import json
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from robonomics_ros2_interfaces.msg import RobonomicsROS2ReceivedLaunch
 
 from robonomics_ros2_robot_handler.basic_robonomics_handler import BasicRobonomicsHandler
@@ -16,6 +17,7 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
     def __init__(self) -> None:
         super().__init__()
 
+        lifecycle_callback_group = MutuallyExclusiveCallbackGroup()
         # Subscription for navigator topic with archive file name
         self.subscriber_archive_name = self.create_subscription(
             String,
@@ -28,6 +30,7 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
         self.change_navigator_state_client = self.create_client(
             ChangeState,
             '/johnny_lab_navigator/change_state',
+            callback_group=lifecycle_callback_group,
         )
 
     def launch_file_subscriber_callback(self, msg: RobonomicsROS2ReceivedLaunch) -> None:
@@ -37,7 +40,14 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
             try:
                 data = json.load(launch_file)
                 if data['transition'] == 'new_game':
-                    self.change_navigator_state_request()
+                    self.change_navigator_state_request(
+                        request_id=Transition.TRANSITION_CONFIGURE,
+                        request_label='configure'
+                    )
+                    self.change_navigator_state_request(
+                        request_id=Transition.TRANSITION_CLEANUP,
+                        request_label='cleanup'
+                    )
             except Exception as e:
                 self.get_logger().error('Launch handling failed: %s' % str(e))
 
@@ -54,19 +64,22 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
 
         self.send_datalog_request(archive_file_name, encrypt_recipient_addresses=rws_users_list)
 
-    def change_navigator_state_request(self) -> bool:
+    def change_navigator_state_request(self,
+                                       request_id,
+                                       request_label
+                                       ) -> bool:
 
         # Preparing a request
         request = ChangeState.Request()
-        request.transition.id = Transition.TRANSITION_CONFIGURE
-        request.transition.label = 'configure'
-        self.get_logger().info('Sending request to configure')
+        request.transition.id = request_id
+        request.transition.label = request_label
+        self.get_logger().info('Sending request to change state to: %s' % request_label)
 
         # Making a request and wait for its execution
         future = self.change_navigator_state_client.call_async(request)
         self.executor.spin_until_future_complete(future)
 
-        self.get_logger().info('After sending request to configure')
+        self.get_logger().info('After sending to change state to: %s' % request_label)
 
         return future.result().success
 
