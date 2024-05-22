@@ -44,10 +44,10 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
                         request_id=Transition.TRANSITION_CONFIGURE,
                         request_label='configure'
                     )
-                    self.change_navigator_state_request(
-                        request_id=Transition.TRANSITION_CLEANUP,
-                        request_label='cleanup'
-                    )
+                    # self.change_navigator_state_request(
+                    #     request_id=Transition.TRANSITION_CLEANUP,
+                    #     request_label='cleanup'
+                    # )
             except Exception as e:
                 self.get_logger().error('Launch handling failed: %s' % str(e))
 
@@ -60,7 +60,7 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
         archive_file_name = str(msg.data)
 
         # Get new subscription users
-        rws_users_list = self.get_rws_users_client()
+        rws_users_list = self.get_rws_users_request()
 
         self.send_datalog_request(archive_file_name, encrypt_recipient_addresses=rws_users_list)
 
