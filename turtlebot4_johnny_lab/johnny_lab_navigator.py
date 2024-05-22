@@ -13,6 +13,7 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import DockStatus
 from action_msgs.msg import GoalStatus
+from nav2_msgs.action import NavigateToPose
 
 from turtlebot4_navigation.turtlebot4_navigator import TurtleBot4Directions
 
@@ -40,18 +41,21 @@ class JohnnyLabNavigator(Node):
             navigator_params_dict = yaml.load(navigator_config_file, Loader=yaml.SafeLoader)
 
         # Load all params
-        self.init_position = navigator_params_dict['init_position']
-        self.init_rotation = navigator_params_dict['init_rotation']
+        self.init_position = navigator_params_dict['init']['position']
+        self.init_rotation = navigator_params_dict['init']['rotation']
 
         self.publisher_initial_pose = None
         self.undock_action_client = None
         self.dock_action_client = None
+        self.nav_to_pose_action_client = None
         self.subscriber_dock_status = None
 
         self.action_status_undock = None
         self.action_status_dock = None
+        self.action_status_nav_to_pose = None
         self.is_docked = None
         self.initial_pose = None
+        self.action_feedback = None
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """
@@ -63,7 +67,7 @@ class JohnnyLabNavigator(Node):
 
         self.get_logger().info('Configuring navigator')
 
-        callback_group = MutuallyExclusiveCallbackGroup()
+        main_callback_group = MutuallyExclusiveCallbackGroup()
 
         try:
             self.initial_pose = self.get_pose_stamped(
@@ -76,7 +80,7 @@ class JohnnyLabNavigator(Node):
             PoseWithCovarianceStamped,
             'initialpose',
             qos_profile=qos_profile_system_default,
-            callback_group=callback_group,
+            callback_group=main_callback_group,
         )
 
         self.subscriber_dock_status = self.create_subscription(
@@ -90,14 +94,21 @@ class JohnnyLabNavigator(Node):
             self,
             Undock,
             'undock',
-            callback_group=callback_group
+            callback_group=main_callback_group
         )
 
         self.dock_action_client = ActionClient(
             self,
             Dock,
             'dock',
-            callback_group=callback_group
+            callback_group=main_callback_group
+        )
+
+        self.nav_to_pose_action_client = ActionClient(
+            self,
+            NavigateToPose,
+            'navigate_to_pose',
+            callback_group=main_callback_group
         )
 
         self.get_logger().info('Configuring is done')
@@ -229,8 +240,11 @@ class JohnnyLabNavigator(Node):
         A function for sending goal to undock action
         :return: None
         """
+
+        while not self.undock_action_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info("Undock action server not available, waiting...")
+
         goal_msg = Undock.Goal()
-        self.undock_action_client.wait_for_server()
         send_goal_future = self.undock_action_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.undock_response_callback)
 
@@ -260,8 +274,11 @@ class JohnnyLabNavigator(Node):
         A function for sending goal to dock action
         :return: None
         """
+
+        while not self.dock_action_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info("Dock action server not available, waiting...")
+
         goal_msg = Dock.Goal()
-        self.dock_action_client.wait_for_server()
         send_goal_future = self.dock_action_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.dock_response_callback)
 
@@ -285,6 +302,45 @@ class JohnnyLabNavigator(Node):
         else:
             self.get_logger().warn('Docking is failed, trying again')
             self.action_status_dock = GoalStatus.STATUS_ABORTED
+
+    def send_goal_nav_to_pose(self,
+                              pose: PoseStamped,
+                              behavior_tree: str = ''):
+
+        while not self.nav_to_pose_action_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info("NavigateToPose action server not available, waiting...")
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = pose
+        goal_msg.behavior_tree = behavior_tree
+
+        self.get_logger().info('Navigating to goal: ' + str(pose.pose.position.x) + ', ' + str(pose.pose.position.y))
+        send_goal_future = self.nav_to_pose_action_client.send_goal_async(goal_msg, self.action_feedback_callback)
+        send_goal_future.add_done_callback(self.nav_to_pose_response_callback)
+
+    def nav_to_pose_response_callback(self,future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Goal to was rejected!')
+            return
+
+        # Waiting for finishing the goal to proceed for its result
+        get_result_future = goal_handle.get_result_async()
+        get_result_future.add_done_callback(self.nav_to_pose_result_callback)
+
+    def nav_to_pose_result_callback(self, future):
+        result = future.result().result.error_code
+        if result == NavigateToPose.NONE:
+            self.get_logger().info('Navigation to goal is done')
+            self.action_status_nav_to_pose = GoalStatus.STATUS_SUCCEEDED
+        else:
+            self.get_logger().warn('Navigation to goal is failed, trying again')
+            self.action_status_nav_to_pose = GoalStatus.STATUS_ABORTED
+
+    def action_feedback_callback(self, msg):
+        self.get_logger().debug('Received action feedback message')
+        self.action_feedback = msg.feedback
+        return
 
 
 def main(args=None) -> None:
