@@ -7,6 +7,14 @@
   <maintainer email="fingerling42@proton.me">Ivan Berman</maintainer>
   <license>TODO: License declaration</license>
 
+  <depend>rcl_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>irobot_create_msgs</depend>
+  <depend>action_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>robonomics_ros2_robot_handler</depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
