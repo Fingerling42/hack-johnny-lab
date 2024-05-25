@@ -2,6 +2,7 @@ import math
 import yaml
 import json
 import os
+import time
 import random
 from datetime import datetime
 from zipfile import ZipFile
@@ -9,20 +10,25 @@ from zipfile import ZipFile
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.lifecycle import Node, LifecycleState, Publisher, State, TransitionCallbackReturn
-from typing_extensions import Self, Any, Optional
+from rclpy.node import Subscription
+from rclpy import Future
+
+from typing_extensions import Self, Any, Optional, List, Dict
+from io import TextIOWrapper
 
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 from rcl_interfaces.msg import ParameterDescriptor
+from rcl_interfaces.srv import GetParameters
+
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+
 from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import DockStatus
+
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import NavigateToPose
-from rcl_interfaces.srv import GetParameters
 from std_msgs.msg import String
-
-from turtlebot4_navigation.turtlebot4_navigator import TurtleBot4Directions
 
 from rclpy.qos import qos_profile_sensor_data, qos_profile_system_default
 
@@ -30,6 +36,10 @@ from rclpy.executors import MultiThreadedExecutor
 
 
 class JohnnyLabNavigator(Node):
+    """
+    A class controlling Turtlebot in Johnny Lab
+    """
+
     def __init__(self) -> None:
         super().__init__('johnny_lab_navigator')
 
@@ -42,9 +52,6 @@ class JohnnyLabNavigator(Node):
                 ('navigator_params_path',
                  rclpy.Parameter.Type.STRING,
                  ParameterDescriptor(description='Path to navigator config file with parameters')),
-                ('seeds_file_path',
-                 rclpy.Parameter.Type.STRING,
-                 ParameterDescriptor(description='Path to file that contains all seeds')),
             ]
         )
 
@@ -57,7 +64,7 @@ class JohnnyLabNavigator(Node):
         try:
             self.initial_pose = self.get_pose_stamped(
                 navigator_params_dict['init']['position'],
-                navigator_params_dict['init']['rotation'] * 180 / math.pi)
+                navigator_params_dict['init']['rotation'])
         except Exception as e:
             self.get_logger().error('Error: %s' % str(e))
 
@@ -67,7 +74,7 @@ class JohnnyLabNavigator(Node):
             try:
                 pose = self.get_pose_stamped(
                     navigator_params_dict['points'][point]['position'],
-                    navigator_params_dict['points'][point]['rotation'] * 180 / math.pi)
+                    navigator_params_dict['points'][point]['rotation'])
                 pose_dict = {
                     'label':    str(point),
                     'pose':     pose,
@@ -75,9 +82,6 @@ class JohnnyLabNavigator(Node):
                 self.goal_poses.append(pose_dict)
             except Exception as e:
                 self.get_logger().error('Error in getting goal poses: %s' % str(e))
-
-        # Open file with all seeds
-        self.seeds_file_path = self.get_parameter('seeds_file_path').value
 
         # Service for getting IPFS dir from pubsub
         self.get_pubsub_parameter_client = self.create_client(
@@ -88,6 +92,15 @@ class JohnnyLabNavigator(Node):
         while not self.get_pubsub_parameter_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn('Pubsub parameter service not available, waiting again...')
 
+        # Service for getting file name with seed
+        self.get_seed_parameter_client = self.create_client(
+            GetParameters,
+            'johnny_lab_navigator/robonomics_ros2_robot_handler/get_parameters',
+            callback_group=self.main_callback_group
+        )
+        while not self.get_seed_parameter_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn('Seed parameter service not available, waiting again...')
+
         # Creating publisher for archive file name after all work is done
         self.publisher_archive_name = self.create_publisher(
             String,
@@ -97,23 +110,23 @@ class JohnnyLabNavigator(Node):
         )
 
         # Variable init
-        self.publisher_initial_pose = None
-        self.undock_action_client = None
-        self.dock_action_client = None
-        self.nav_to_pose_action_client = None
-        self.subscriber_dock_status = None
+        self.publisher_initial_pose: Optional[Publisher] = None
+        self.undock_action_client: Optional[ActionClient] = None
+        self.dock_action_client: Optional[ActionClient] = None
+        self.nav_to_pose_action_client: Optional[ActionClient] = None
+        self.subscriber_dock_status: Optional[Subscription] = None
 
-        self.action_status_undock = None
-        self.action_status_dock = None
-        self.action_status_nav_to_pose = None
-        self.is_docked = None
-        self.initial_pose = None
-        self.action_feedback = None
-        self.goal_random_poses_words = None
-        self.ipfs_dir_path = None
-        self.data_path = None
-        self.data_file = None
-        self.archive_path = None
+        self.action_status_undock: Optional[int] = None
+        self.action_status_dock: Optional[int] = None
+        self.action_status_nav_to_pose: Optional[int] = None
+        self.is_docked: Optional[bool] = None
+        self.action_feedback: Optional[NavigateToPose.Feedback()] = None
+        self.goal_random_poses_words: Optional[List[Dict]] = None
+        self.ipfs_dir_path: Optional[str] = None
+        self.data_path: Optional[str] = None
+        self.data_file: Optional[TextIOWrapper] = None
+        self.archive_path: Optional[str] = None
+        self.seeds_file_path: Optional[str] = None
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """
@@ -125,12 +138,26 @@ class JohnnyLabNavigator(Node):
 
         self.get_logger().info('Configuring navigator')
 
+        # Make request to get pubsub parameter with IPFS path if it not exists
+        if self.ipfs_dir_path is None:
+            request_ipfs = GetParameters.Request()
+            request_ipfs.names = ['ipfs_dir_path']
+            future_ipfs = self.get_pubsub_parameter_client.call_async(request_ipfs)
+            self.executor.spin_until_future_complete(future_ipfs)
+            self.ipfs_dir_path = future_ipfs.result().values[0].string_value
+
         #  Getting seed phrase and its words
+        request_seed = GetParameters.Request()
+        request_seed.names = ['seed_file_name']
+        future_seed = self.get_seed_parameter_client.call_async(request_seed)
+        self.executor.spin_until_future_complete(future_seed)
+        seed_file_name = future_seed.result().values[0].string_value
+
+        self.seeds_file_path = os.path.join(self.ipfs_dir_path, seed_file_name)
+
         with open(self.seeds_file_path, 'r') as seeds_file:
-            seed_phrase = seeds_file.readline()
-            with open(self.seeds_file_path + '_temp', 'w') as temp_file:
-                for line in seeds_file:
-                    temp_file.write(line)
+            seed_data = json.load(seeds_file)
+            seed_phrase = seed_data['seed']
 
         seed_phrase = seed_phrase.strip()
         seed_words = list(seed_phrase.split(' '))
@@ -142,14 +169,6 @@ class JohnnyLabNavigator(Node):
 
         # Randomize poses with words
         random.shuffle(self.goal_random_poses_words)
-
-        # Make request to get pubsub parameter with IPFS path if it not exists
-        if self.ipfs_dir_path is None:
-            request = GetParameters.Request()
-            request.names = ['ipfs_dir_path']
-            future = self.get_pubsub_parameter_client.call_async(request)
-            self.executor.spin_until_future_complete(future)
-            self.ipfs_dir_path = future.result().values[0].string_value
 
         # Prepare files for archive
         self.data_path = os.path.join(self.ipfs_dir_path, 'data.json')
@@ -212,35 +231,51 @@ class JohnnyLabNavigator(Node):
 
         self.get_logger().info('Navigator in active state')
 
+        # Wait for dock status
+        while self.is_docked is None:
+            pass
+
+        # Undock if docked
+        if self.is_docked is True:
+            self.send_goal_undock()
+            while self.action_status_undock != GoalStatus.STATUS_SUCCEEDED:
+                if self.action_status_undock == GoalStatus.STATUS_ABORTED:
+                    self.action_status_undock = None
+                    self.send_goal_undock()
+                pass
+
+        # Set the initial pose
+        self.set_initial_pose(self.initial_pose)
+
         try:
             point_num = 0
             for goal_pose in self.goal_random_poses_words:
+
                 data_json_dict = {
                     'point_num': point_num,
                     'seed_word': goal_pose['word']
                 }
                 json_data_string = json.dumps(data_json_dict, indent=4)
                 self.data_file.write(json_data_string + ',\n')
+
+                self.send_goal_nav_to_pose(goal_pose['pose'])
+                while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
+                    if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
+                        self.get_logger().warn('Navigation to goal is failed, trying again')
+                        self.action_status_nav_to_pose = None
+                        self.send_goal_nav_to_pose(goal_pose['pose'])
+                    pass
+
+                self.get_logger().info('Navigation to goal is done')
+                self.action_status_nav_to_pose = None
+
                 point_num += 1
+
+                time.sleep(5)
+
             self.data_file.write(']')
         except Exception as e:
             self.get_logger().error('Error in active state: %s' % str(e))
-
-        # # Wait for dock status
-        # while self.is_docked is None:
-        #     pass
-        #
-        # # Undock if docked
-        # if self.is_docked is True:
-        #     self.send_goal_undock()
-        #     while self.action_status_undock != GoalStatus.STATUS_SUCCEEDED:
-        #         if self.action_status_undock == GoalStatus.STATUS_ABORTED:
-        #             self.action_status_undock = None
-        #             self.send_goal_undock()
-        #         pass
-
-        # Set the initial pose
-        #self.set_initial_pose(self.initial_pose)
 
         self.get_logger().info('Navigator is finished active work')
 
@@ -249,13 +284,21 @@ class JohnnyLabNavigator(Node):
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
         self.get_logger().info('Navigator in deactivate state')
 
+        # Return to initial point
+        self.send_goal_nav_to_pose(self.initial_pose)
+        while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
+            if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
+                self.action_status_nav_to_pose = None
+                self.send_goal_nav_to_pose(self.initial_pose)
+            pass
+
         # Dock the robot, until success
-        # self.send_goal_dock()
-        # while self.action_status_dock != GoalStatus.STATUS_SUCCEEDED:
-        #     if self.action_status_dock == GoalStatus.STATUS_ABORTED:
-        #         self.action_status_dock = None
-        #         self.send_goal_dock()
-        #     pass
+        self.send_goal_dock()
+        while self.action_status_dock != GoalStatus.STATUS_SUCCEEDED:
+            if self.action_status_dock == GoalStatus.STATUS_ABORTED:
+                self.action_status_dock = None
+                self.send_goal_dock()
+            pass
 
         self.get_logger().info('Navigator is deactivated')
 
@@ -277,28 +320,21 @@ class JohnnyLabNavigator(Node):
         with ZipFile(self.archive_path, 'w') as zip_file:
             zip_file.write(self.data_path, os.path.basename(self.data_path))
 
-        # Rewrite seed file without first seed and remove temp file
-        with open(self.seeds_file_path + '_temp', 'r') as temp_file:
-            with open(self.seeds_file_path, 'w') as seeds_file:
-                for line in temp_file:
-                    seeds_file.write(line)
-
         # Garbage removal routine
         os.remove(self.data_path)
-        os.remove(self.seeds_file_path + '_temp')
 
-        # Publish last message with archive name
-        archive_name_msg = String()
-        archive_name_msg.data = str(os.path.basename(self.archive_path))
-        self.publisher_archive_name.publish(archive_name_msg)
-        self.publisher_archive_name.wait_for_all_acked()
+        # # Publish last message with archive name
+        # archive_name_msg = String()
+        # archive_name_msg.data = str(os.path.basename(self.archive_path))
+        # self.publisher_archive_name.publish(archive_name_msg)
+        # self.publisher_archive_name.wait_for_all_acked()
 
         # Destroy ROS entities
         self.destroy_publisher(self.publisher_initial_pose)
-        self.destroy_client(self.undock_action_client)
-        self.destroy_client(self.dock_action_client)
-        self.destroy_client(self.nav_to_pose_action_client)
         self.destroy_subscription(self.subscriber_dock_status)
+        self.undock_action_client.destroy()
+        self.dock_action_client.destroy()
+        self.nav_to_pose_action_client.destroy()
 
         # Clear variables
         self.action_status_undock = None
@@ -310,6 +346,7 @@ class JohnnyLabNavigator(Node):
         self.data_path = None
         self.archive_path = None
         self.data_file = None
+        self.seeds_file_path = None
 
         self.get_logger().info('All done')
 
@@ -342,7 +379,9 @@ class JohnnyLabNavigator(Node):
         :return: None
         """
 
-    def get_pose_stamped(self, position, rotation):
+    def get_pose_stamped(self,
+                         position: List[float],
+                         rotation: float) -> PoseStamped:
         """
         Fill and return a PoseStamped message.
 
@@ -364,7 +403,7 @@ class JohnnyLabNavigator(Node):
 
         return pose
 
-    def set_initial_pose(self, initial_pose):
+    def set_initial_pose(self, initial_pose: PoseStamped) -> None:
         msg = PoseWithCovarianceStamped()
         msg.pose.pose = initial_pose.pose
         msg.header.frame_id = initial_pose.header.frame_id
@@ -373,10 +412,10 @@ class JohnnyLabNavigator(Node):
 
         self.publisher_initial_pose.publish(msg)
 
-    def dock_status_callback(self, msg: DockStatus):
+    def dock_status_callback(self, msg: DockStatus) -> None:
         self.is_docked = msg.is_docked
 
-    def send_goal_undock(self):
+    def send_goal_undock(self) -> None:
         """
         A function for sending goal to undock action
         :return: None
@@ -389,7 +428,7 @@ class JohnnyLabNavigator(Node):
         send_goal_future = self.undock_action_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.undock_response_callback)
 
-    def undock_response_callback(self, future):
+    def undock_response_callback(self, future: Future) -> None:
         # Checking that goal is accepted
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -401,7 +440,7 @@ class JohnnyLabNavigator(Node):
         get_result_future = goal_handle.get_result_async()
         get_result_future.add_done_callback(self.undock_result_callback)
 
-    def undock_result_callback(self, future):
+    def undock_result_callback(self, future: Future) -> None:
         result = future.result().result.is_docked
         if result is False:
             self.get_logger().info('Undocking is done')
@@ -410,7 +449,7 @@ class JohnnyLabNavigator(Node):
             self.get_logger().warn('Undocking is failed, trying again')
             self.action_status_undock = GoalStatus.STATUS_ABORTED
 
-    def send_goal_dock(self):
+    def send_goal_dock(self) -> None:
         """
         A function for sending goal to dock action
         :return: None
@@ -423,7 +462,7 @@ class JohnnyLabNavigator(Node):
         send_goal_future = self.dock_action_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.dock_response_callback)
 
-    def dock_response_callback(self, future):
+    def dock_response_callback(self, future: Future) -> None:
         # Checking that goal is accepted
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -435,7 +474,7 @@ class JohnnyLabNavigator(Node):
         get_result_future = goal_handle.get_result_async()
         get_result_future.add_done_callback(self.dock_result_callback)
 
-    def dock_result_callback(self, future):
+    def dock_result_callback(self, future: Future) -> None:
         result = future.result().result.is_docked
         if result is True:
             self.get_logger().info('Docking is done')
@@ -446,7 +485,7 @@ class JohnnyLabNavigator(Node):
 
     def send_goal_nav_to_pose(self,
                               pose: PoseStamped,
-                              behavior_tree: str = ''):
+                              behavior_tree: str = '') -> None:
 
         while not self.nav_to_pose_action_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().info("NavigateToPose action server not available, waiting...")
@@ -459,26 +498,20 @@ class JohnnyLabNavigator(Node):
         send_goal_future = self.nav_to_pose_action_client.send_goal_async(goal_msg, self.action_feedback_callback)
         send_goal_future.add_done_callback(self.nav_to_pose_response_callback)
 
-    def nav_to_pose_response_callback(self, future):
+    def nav_to_pose_response_callback(self, future: Future) -> None:
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().warn('Goal to was rejected!')
+            self.get_logger().warn('Goal was rejected!')
             return
 
         # Waiting for finishing the goal to proceed for its result
         get_result_future = goal_handle.get_result_async()
         get_result_future.add_done_callback(self.nav_to_pose_result_callback)
 
-    def nav_to_pose_result_callback(self, future):
-        result = future.result().result.error_code
-        if result == NavigateToPose.NONE:
-            self.get_logger().info('Navigation to goal is done')
-            self.action_status_nav_to_pose = GoalStatus.STATUS_SUCCEEDED
-        else:
-            self.get_logger().warn('Navigation to goal is failed, trying again')
-            self.action_status_nav_to_pose = GoalStatus.STATUS_ABORTED
+    def nav_to_pose_result_callback(self, future: Future) -> None:
+        self.action_status_nav_to_pose = future.result().status
 
-    def action_feedback_callback(self, msg):
+    def action_feedback_callback(self, msg: NavigateToPose.Feedback()):
         self.get_logger().debug('Received action feedback message')
         self.action_feedback = msg.feedback
         return
