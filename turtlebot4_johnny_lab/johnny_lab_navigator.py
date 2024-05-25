@@ -146,7 +146,7 @@ class JohnnyLabNavigator(Node):
             self.executor.spin_until_future_complete(future_ipfs)
             self.ipfs_dir_path = future_ipfs.result().values[0].string_value
 
-        #  Getting seed phrase and its words
+        #  Getting launch file name with seed phrase
         request_seed = GetParameters.Request()
         request_seed.names = ['seed_file_name']
         future_seed = self.get_seed_parameter_client.call_async(request_seed)
@@ -155,17 +155,23 @@ class JohnnyLabNavigator(Node):
 
         self.seeds_file_path = os.path.join(self.ipfs_dir_path, seed_file_name)
 
+        # Open file and get seed phrase
         with open(self.seeds_file_path, 'r') as seeds_file:
             seed_data = json.load(seeds_file)
             seed_phrase = seed_data['seed']
 
-        seed_phrase = seed_phrase.strip()
-        seed_words = list(seed_phrase.split(' '))
+        # Split seed phrase into 2 words in pairs
+        words_list = list(seed_phrase.split(' '))
+        two_words_list = []
 
-        # Add seed words to new list with goal poses dicts
+        for i in range(0, len(words_list), 2):
+            two_words = words_list[i] + ' ' + words_list[i + 1]
+            two_words_list.append(two_words)
+
+        # Add pairs of words to new list with goal poses dicts
         self.goal_random_poses_words = self.goal_poses.copy()
-        for i in range(0, len(seed_words)):
-            self.goal_random_poses_words[i].update({'word': seed_words[i]})
+        for i in range(0, len(two_words_list)):
+            self.goal_random_poses_words[i].update({'2 words': two_words_list[i]})
 
         # Randomize poses with words
         random.shuffle(self.goal_random_poses_words)
