@@ -1,10 +1,14 @@
 import os
 import json
 
+from typing_extensions import Dict
+
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.parameter import Parameter
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from robonomics_ros2_interfaces.msg import RobonomicsROS2ReceivedLaunch
+from rcl_interfaces.msg import ParameterDescriptor
 
 from robonomics_ros2_robot_handler.basic_robonomics_handler import BasicRobonomicsHandler
 from std_msgs.msg import String
@@ -16,6 +20,15 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
 
     def __init__(self) -> None:
         super().__init__()
+
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('seed_file_name',
+                 '',
+                 ParameterDescriptor(description='Name of seed file')),
+            ]
+        )
 
         lifecycle_callback_group = MutuallyExclusiveCallbackGroup()
         # Subscription for navigator topic with archive file name
@@ -38,8 +51,16 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
 
         with open(os.path.join(self.ipfs_dir_path, self.param_file_name), 'r') as launch_file:
             try:
-                data = json.load(launch_file)
-                if data['transition'] == 'new_game':
+                data: Dict = json.load(launch_file)
+                if 'seed' in data:
+
+                    # Set IPFS path parameter
+                    seed_file_name_param = Parameter(
+                        'seed_file_name',
+                        rclpy.Parameter.Type.STRING,
+                        self.param_file_name)
+                    self.set_parameters([seed_file_name_param])
+
                     self.change_navigator_state_request(
                         request_id=Transition.TRANSITION_CONFIGURE,
                         request_label='configure'
