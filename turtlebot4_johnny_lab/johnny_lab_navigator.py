@@ -65,6 +65,10 @@ class JohnnyLabNavigator(Node):
             self.initial_pose = self.get_pose_stamped(
                 navigator_params_dict['init']['position'],
                 navigator_params_dict['init']['rotation'])
+
+            self.initial_pose_back = self.get_pose_stamped(
+                navigator_params_dict['init']['position'],
+                0.0)
         except Exception as e:
             self.get_logger().error('Error: %s' % str(e))
 
@@ -171,7 +175,7 @@ class JohnnyLabNavigator(Node):
         # Add pairs of words to new list with goal poses dicts
         self.goal_random_poses_words = self.goal_poses.copy()
         for i in range(0, len(two_words_list)):
-            self.goal_random_poses_words[i].update({'2 words': two_words_list[i]})
+            self.goal_random_poses_words[i].update({'words': two_words_list[i]})
 
         # Randomize poses with words
         random.shuffle(self.goal_random_poses_words)
@@ -259,7 +263,7 @@ class JohnnyLabNavigator(Node):
 
                 data_json_dict = {
                     'point_num': point_num,
-                    'seed_word': goal_pose['word']
+                    'two_words': goal_pose['words']
                 }
                 json_data_string = json.dumps(data_json_dict, indent=4)
                 self.data_file.write(json_data_string + ',\n')
@@ -291,11 +295,12 @@ class JohnnyLabNavigator(Node):
         self.get_logger().info('Navigator in deactivate state')
 
         # Return to initial point
-        self.send_goal_nav_to_pose(self.initial_pose)
+
+        self.send_goal_nav_to_pose(self.initial_pose_back)
         while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
             if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
                 self.action_status_nav_to_pose = None
-                self.send_goal_nav_to_pose(self.initial_pose)
+                self.send_goal_nav_to_pose(self.initial_pose_back)
             pass
 
         # Dock the robot, until success
@@ -329,11 +334,11 @@ class JohnnyLabNavigator(Node):
         # Garbage removal routine
         os.remove(self.data_path)
 
-        # # Publish last message with archive name
-        # archive_name_msg = String()
-        # archive_name_msg.data = str(os.path.basename(self.archive_path))
-        # self.publisher_archive_name.publish(archive_name_msg)
-        # self.publisher_archive_name.wait_for_all_acked()
+        # Publish last message with archive name
+        archive_name_msg = String()
+        archive_name_msg.data = str(os.path.basename(self.archive_path))
+        self.publisher_archive_name.publish(archive_name_msg)
+        self.publisher_archive_name.wait_for_all_acked()
 
         # Destroy ROS entities
         self.destroy_publisher(self.publisher_initial_pose)
