@@ -22,15 +22,6 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
     def __init__(self) -> None:
         super().__init__()
 
-        self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('seed_file_name',
-                 '',
-                 ParameterDescriptor(description='Name of seed file')),
-            ]
-        )
-
         lifecycle_callback_group = MutuallyExclusiveCallbackGroup()
         # Subscription for navigator topic with archive file name
         self.subscriber_archive_name = self.create_subscription(
@@ -50,38 +41,36 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
     def launch_file_subscriber_callback(self, msg: RobonomicsROS2ReceivedLaunch) -> None:
         super(JohnnyLabRobonomics, self).launch_file_subscriber_callback(msg)
 
-        with open(os.path.join(self.ipfs_dir_path, self.param_file_name), 'r') as launch_file:
+        # Rename file with param
+        old_param_file = os.path.join(self.ipfs_dir_path, self.param_file_name)
+        new_param_file = os.path.join(self.ipfs_dir_path, 'johnny_lab_launch.json')
+        os.rename(old_param_file, new_param_file)
+
+        with open(new_param_file, 'r') as launch_file:
             try:
                 data: Dict = json.load(launch_file)
                 if 'seed' in data:
-
-                    # Set IPFS path parameter
-                    seed_file_name_param = Parameter(
-                        'seed_file_name',
-                        rclpy.Parameter.Type.STRING,
-                        self.param_file_name)
-                    self.set_parameters([seed_file_name_param])
 
                     # Send command to configure navigator
                     self.change_navigator_state_request(
                         request_id=Transition.TRANSITION_CONFIGURE,
                         request_label='configure'
                     )
-                    time.sleep(5)
+                    time.sleep(15)
 
                     # Send command to activate navigator
                     self.change_navigator_state_request(
                         request_id=Transition.TRANSITION_ACTIVATE,
                         request_label='activate'
                     )
-                    time.sleep(5)
+                    time.sleep(15)
 
                     # Send command to deactivate navigator
                     self.change_navigator_state_request(
                         request_id=Transition.TRANSITION_DEACTIVATE,
                         request_label='deactivate'
                     )
-                    time.sleep(5)
+                    time.sleep(15)
 
                     # Send command to clean up navigator
                     self.change_navigator_state_request(

@@ -13,6 +13,10 @@ from rclpy.lifecycle import Node, LifecycleState, Publisher, State, TransitionCa
 from rclpy.node import Subscription
 from rclpy import Future
 
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+
 from typing_extensions import Self, Any, Optional, List, Dict
 from io import TextIOWrapper
 
@@ -114,6 +118,9 @@ class JohnnyLabNavigator(Node):
         )
 
         # Variable init
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         self.publisher_initial_pose: Optional[Publisher] = None
         self.undock_action_client: Optional[ActionClient] = None
         self.dock_action_client: Optional[ActionClient] = None
@@ -150,14 +157,7 @@ class JohnnyLabNavigator(Node):
             self.executor.spin_until_future_complete(future_ipfs)
             self.ipfs_dir_path = future_ipfs.result().values[0].string_value
 
-        #  Getting launch file name with seed phrase
-        request_seed = GetParameters.Request()
-        request_seed.names = ['seed_file_name']
-        future_seed = self.get_seed_parameter_client.call_async(request_seed)
-        self.executor.spin_until_future_complete(future_seed)
-        seed_file_name = future_seed.result().values[0].string_value
-
-        self.seeds_file_path = os.path.join(self.ipfs_dir_path, seed_file_name)
+            self.seeds_file_path = os.path.join(self.ipfs_dir_path, 'johnny_lab_launch.json')
 
         # Open file and get seed phrase
         with open(self.seeds_file_path, 'r') as seeds_file:
@@ -188,6 +188,8 @@ class JohnnyLabNavigator(Node):
 
         self.data_file = open(self.data_path, 'w')
         self.data_file.write('[\n')
+
+        self.get_logger().info('Prepare archive')
 
         # Creating publisher for robot initial pose
         self.publisher_initial_pose = self.create_publisher(
@@ -261,13 +263,6 @@ class JohnnyLabNavigator(Node):
             point_num = 0
             for goal_pose in self.goal_random_poses_words:
 
-                data_json_dict = {
-                    'point_num': point_num,
-                    'two_words': goal_pose['words']
-                }
-                json_data_string = json.dumps(data_json_dict, indent=4)
-                self.data_file.write(json_data_string + ',\n')
-
                 self.send_goal_nav_to_pose(goal_pose['pose'])
                 while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
                     if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
@@ -275,6 +270,31 @@ class JohnnyLabNavigator(Node):
                         self.action_status_nav_to_pose = None
                         self.send_goal_nav_to_pose(goal_pose['pose'])
                     pass
+
+                # Getting pose from transform
+                try:
+                    coord_transform = self.tf_buffer.lookup_transform(
+                        'map',
+                        'base_link',
+                        rclpy.time.Time())
+
+                    robot_position_x = float(coord_transform.transform.translation.x)
+                    robot_position_y = float(coord_transform.transform.translation.y)
+
+                except TransformException:
+                    self.get_logger().warn('Could not make pose transform')
+                    robot_position_x = "NaN"
+                    robot_position_y = "NaN"
+
+                # Prepare dict with data and write in to file
+                data_json_dict = {
+                    'point_num': point_num,
+                    'two_words': goal_pose['words'],
+                    'robot_position_x': robot_position_x,
+                    'robot_position_y': robot_position_y,
+                }
+                json_data_string = json.dumps(data_json_dict, indent=4)
+                self.data_file.write(json_data_string + ',\n')
 
                 self.get_logger().info('Navigation to goal is done')
                 self.action_status_nav_to_pose = None
