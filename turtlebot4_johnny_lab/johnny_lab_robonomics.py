@@ -1,5 +1,6 @@
 import os
 import json
+import time
 
 from typing_extensions import Dict
 
@@ -61,14 +62,32 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
                         self.param_file_name)
                     self.set_parameters([seed_file_name_param])
 
+                    # Send command to configure navigator
                     self.change_navigator_state_request(
                         request_id=Transition.TRANSITION_CONFIGURE,
                         request_label='configure'
                     )
-                    # self.change_navigator_state_request(
-                    #     request_id=Transition.TRANSITION_CLEANUP,
-                    #     request_label='cleanup'
-                    # )
+                    time.sleep(5)
+
+                    # Send command to activate navigator
+                    self.change_navigator_state_request(
+                        request_id=Transition.TRANSITION_ACTIVATE,
+                        request_label='activate'
+                    )
+                    time.sleep(5)
+
+                    # Send command to deactivate navigator
+                    self.change_navigator_state_request(
+                        request_id=Transition.TRANSITION_DEACTIVATE,
+                        request_label='deactivate'
+                    )
+                    time.sleep(5)
+
+                    # Send command to clean up navigator
+                    self.change_navigator_state_request(
+                        request_id=Transition.TRANSITION_CLEANUP,
+                        request_label='cleanup'
+                    )
             except Exception as e:
                 self.get_logger().error('Launch handling failed: %s' % str(e))
 
