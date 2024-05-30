@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node, PushRosNamespace
 
-from launch.actions import GroupAction, DeclareLaunchArgument
+from launch.actions import GroupAction, DeclareLaunchArgument, TimerAction
 from launch.substitutions import LaunchConfiguration
 
 # Launch arguments
@@ -40,6 +40,12 @@ def generate_launch_description():
         package='turtlebot4_johnny_lab',
         executable='johnny_lab_robonomics',
         emulate_tty=True,
+        namespace=LaunchConfiguration('namespace')
+    )
+
+    robonomics_handler_timer = TimerAction(
+        period=20.0,
+        actions=[johnny_lab_robonomics]
     )
 
     # Navigator node for Johnny Lab
@@ -52,15 +58,20 @@ def generate_launch_description():
         }],
     )
 
+    robonomics_navigator_timer = TimerAction(
+        period=40.0,
+        actions=[johnny_lab_navigator]
+    )
+
     namespace_launch_action = GroupAction(
         actions=[
             PushRosNamespace(LaunchConfiguration('namespace')),
             robonomics_pubsub_node,
-            johnny_lab_robonomics
+            robonomics_handler_timer
         ]
     )
 
     ld.add_action(namespace_launch_action)
-    ld.add_action(johnny_lab_navigator)
+    ld.add_action(robonomics_navigator_timer)
 
     return ld
