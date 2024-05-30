@@ -7,6 +7,10 @@ import random
 from datetime import datetime
 from zipfile import ZipFile
 
+import depthai as dai
+import av
+from fractions import Fraction
+
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.lifecycle import Node, LifecycleState, Publisher, State, TransitionCallbackReturn
@@ -20,7 +24,7 @@ from tf2_ros.transform_listener import TransformListener
 from typing_extensions import Self, Any, Optional, List, Dict
 from io import TextIOWrapper
 
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 
 from rcl_interfaces.msg import ParameterDescriptor
 from rcl_interfaces.srv import GetParameters
@@ -47,7 +51,9 @@ class JohnnyLabNavigator(Node):
     def __init__(self) -> None:
         super().__init__('johnny_lab_navigator')
 
+        # Callback groups
         self.main_callback_group = MutuallyExclusiveCallbackGroup()
+        self.free_callback_group = ReentrantCallbackGroup()
 
         # Declare used parameters
         self.declare_parameters(
@@ -64,7 +70,7 @@ class JohnnyLabNavigator(Node):
         with open(navigator_params_path, 'r') as navigator_config_file:
             navigator_params_dict = yaml.load(navigator_config_file, Loader=yaml.SafeLoader)
 
-        # Get initial pose
+        # Get initial pose and its reverse pose
         try:
             self.initial_pose = self.get_pose_stamped(
                 navigator_params_dict['init']['position'],
@@ -97,35 +103,35 @@ class JohnnyLabNavigator(Node):
             'johnny_lab_navigator/robonomics_ros2_pubsub/get_parameters',
             callback_group=self.main_callback_group
         )
-        while not self.get_pubsub_parameter_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('Pubsub parameter service not available, waiting again...')
-
-        # Service for getting file name with seed
-        self.get_seed_parameter_client = self.create_client(
-            GetParameters,
-            'johnny_lab_navigator/robonomics_ros2_robot_handler/get_parameters',
-            callback_group=self.main_callback_group
-        )
-        while not self.get_seed_parameter_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('Seed parameter service not available, waiting again...')
 
         # Creating publisher for archive file name after all work is done
         self.publisher_archive_name = self.create_publisher(
             String,
             'johnny_lab_navigator/archive_name',
             10,
-            callback_group=self.main_callback_group
+            callback_group=self.free_callback_group
         )
+
+        # Video init
+        self.video_fps = 10
+        self.video_pipeline = dai.Pipeline()
+        oakd_camera = self.video_pipeline.create(dai.node.ColorCamera)
+        oakd_camera.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        oakd_camera.setIspScale(1, 3)
+        oakd_camera.setVideoSize(352, 288)
+        oakd_camera.setFps(self.video_fps)
+
+        video_encoder = self.video_pipeline.create(dai.node.VideoEncoder)
+        video_encoder.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.H265_MAIN)
+        oakd_camera.video.link(video_encoder.input)
+
+        xout = self.video_pipeline.create(dai.node.XLinkOut)
+        xout.setStreamName('enc')
+        video_encoder.bitstream.link(xout.input)
 
         # Variable init
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self.publisher_initial_pose: Optional[Publisher] = None
-        self.undock_action_client: Optional[ActionClient] = None
-        self.dock_action_client: Optional[ActionClient] = None
-        self.nav_to_pose_action_client: Optional[ActionClient] = None
-        self.subscriber_dock_status: Optional[Subscription] = None
 
         self.action_status_undock: Optional[int] = None
         self.action_status_dock: Optional[int] = None
@@ -135,9 +141,54 @@ class JohnnyLabNavigator(Node):
         self.goal_random_poses_words: Optional[List[Dict]] = None
         self.ipfs_dir_path: Optional[str] = None
         self.data_path: Optional[str] = None
+        self.video_path: Optional[str] = None
         self.data_file: Optional[TextIOWrapper] = None
         self.archive_path: Optional[str] = None
         self.seeds_file_path: Optional[str] = None
+        self.video_record_status: Optional[bool] = None
+
+        # Creating publisher for robot initial pose
+        self.publisher_initial_pose = self.create_publisher(
+            PoseWithCovarianceStamped,
+            'initialpose',
+            qos_profile=qos_profile_system_default,
+            callback_group=self.free_callback_group,
+        )
+
+        # Creating subscriber to get dock status of robot
+        self.subscriber_dock_status = self.create_subscription(
+            DockStatus,
+            'dock_status',
+            self.dock_status_callback,
+            qos_profile_sensor_data,
+            callback_group=self.free_callback_group
+        )
+
+        # Creating action client for undocking
+        self.undock_action_client = ActionClient(
+            self,
+            Undock,
+            'undock',
+            callback_group=self.free_callback_group
+        )
+
+        # Creating action client for docking
+        self.dock_action_client = ActionClient(
+            self,
+            Dock,
+            'dock',
+            callback_group=self.free_callback_group
+        )
+
+        # Creating action for navigation to pose
+        self.nav_to_pose_action_client = ActionClient(
+            self,
+            NavigateToPose,
+            'navigate_to_pose',
+            callback_group=self.free_callback_group
+        )
+
+        self.get_logger().info('Navigator init is done')
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """
@@ -151,18 +202,17 @@ class JohnnyLabNavigator(Node):
 
         # Make request to get pubsub parameter with IPFS path if it not exists
         if self.ipfs_dir_path is None:
-            request_ipfs = GetParameters.Request()
-            request_ipfs.names = ['ipfs_dir_path']
-            future_ipfs = self.get_pubsub_parameter_client.call_async(request_ipfs)
-            self.executor.spin_until_future_complete(future_ipfs)
-            self.ipfs_dir_path = future_ipfs.result().values[0].string_value
-
+            self.ipfs_dir_path = self.get_pubsub_params_request()
             self.seeds_file_path = os.path.join(self.ipfs_dir_path, 'johnny_lab_launch.json')
+            self.video_path = os.path.join(self.ipfs_dir_path, 'johnny_lab_record.mp4')
+            self.data_path = os.path.join(self.ipfs_dir_path, 'data.json')
 
         # Open file and get seed phrase
         with open(self.seeds_file_path, 'r') as seeds_file:
             seed_data = json.load(seeds_file)
             seed_phrase = seed_data['seed']
+
+        os.remove(self.seeds_file_path)
 
         # Split seed phrase into 2 words in pairs
         words_list = list(seed_phrase.split(' '))
@@ -181,55 +231,12 @@ class JohnnyLabNavigator(Node):
         random.shuffle(self.goal_random_poses_words)
 
         # Prepare files for archive
-        self.data_path = os.path.join(self.ipfs_dir_path, 'data.json')
         current_time = datetime.now()
         self.archive_path = os.path.join(self.ipfs_dir_path, 'johnny_lab_archive_'
                                          + current_time.strftime("%d-%m-%Y-%H-%M-%S") + '.zip')
 
         self.data_file = open(self.data_path, 'w')
         self.data_file.write('[\n')
-
-        self.get_logger().info('Prepare archive')
-
-        # Creating publisher for robot initial pose
-        self.publisher_initial_pose = self.create_publisher(
-            PoseWithCovarianceStamped,
-            'initialpose',
-            qos_profile=qos_profile_system_default,
-            callback_group=self.main_callback_group,
-        )
-
-        # Creating subscriber to get dock status of robot
-        self.subscriber_dock_status = self.create_subscription(
-            DockStatus,
-            'dock_status',
-            self.dock_status_callback,
-            qos_profile_sensor_data
-        )
-
-        # Creating action client for undocking
-        self.undock_action_client = ActionClient(
-            self,
-            Undock,
-            'undock',
-            callback_group=self.main_callback_group
-        )
-
-        # Creating action client for docking
-        self.dock_action_client = ActionClient(
-            self,
-            Dock,
-            'dock',
-            callback_group=self.main_callback_group
-        )
-
-        # Creating action for navigation to pose
-        self.nav_to_pose_action_client = ActionClient(
-            self,
-            NavigateToPose,
-            'navigate_to_pose',
-            callback_group=self.main_callback_group
-        )
 
         self.get_logger().info('Configuring is done')
 
@@ -256,8 +263,19 @@ class JohnnyLabNavigator(Node):
                     self.send_goal_undock()
                 pass
 
+        time.sleep(10)
+
         # Set the initial pose
         self.set_initial_pose(self.initial_pose)
+
+        time.sleep(5)
+
+        # Activate video
+        self.video_record_status = True
+        self.executor.create_task(self.video_routine)
+        self.get_logger().info('Created video routine')
+
+        time.sleep(15)
 
         try:
             point_num = 0
@@ -307,6 +325,9 @@ class JohnnyLabNavigator(Node):
         except Exception as e:
             self.get_logger().error('Error in active state: %s' % str(e))
 
+        # Deactivate video
+        self.video_record_status = False
+
         self.get_logger().info('Navigator is finished active work')
 
         return super().on_activate(state)
@@ -315,7 +336,6 @@ class JohnnyLabNavigator(Node):
         self.get_logger().info('Navigator in deactivate state')
 
         # Return to initial point
-
         self.send_goal_nav_to_pose(self.initial_pose_back)
         while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
             if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
@@ -350,22 +370,19 @@ class JohnnyLabNavigator(Node):
         # Create resulting archive
         with ZipFile(self.archive_path, 'w') as zip_file:
             zip_file.write(self.data_path, os.path.basename(self.data_path))
+            zip_file.write(self.video_path, os.path.basename(self.video_path))
 
         # Garbage removal routine
         os.remove(self.data_path)
+        os.remove(self.video_path)
 
         # Publish last message with archive name
         archive_name_msg = String()
         archive_name_msg.data = str(os.path.basename(self.archive_path))
         self.publisher_archive_name.publish(archive_name_msg)
-        self.publisher_archive_name.wait_for_all_acked()
+        #self.publisher_archive_name.wait_for_all_acked()
 
-        # Destroy ROS entities
-        self.destroy_publisher(self.publisher_initial_pose)
-        self.destroy_subscription(self.subscriber_dock_status)
-        self.undock_action_client.destroy()
-        self.dock_action_client.destroy()
-        self.nav_to_pose_action_client.destroy()
+        time.sleep(15)
 
         # Clear variables
         self.action_status_undock = None
@@ -374,10 +391,9 @@ class JohnnyLabNavigator(Node):
         self.is_docked = None
         self.action_feedback = None
         self.goal_random_poses_words = None
-        self.data_path = None
         self.archive_path = None
         self.data_file = None
-        self.seeds_file_path = None
+        self.video_record_status = None
 
         self.get_logger().info('All done')
 
@@ -547,11 +563,54 @@ class JohnnyLabNavigator(Node):
         self.action_feedback = msg.feedback
         return
 
+    def video_routine(self):
+
+        # Activate video
+        oakd_device = dai.Device(self.video_pipeline)
+
+        device_queue = oakd_device.getOutputQueue(name="enc", maxSize=30, blocking=True)
+
+        output_container = av.open(self.video_path, 'w')
+        stream = output_container.add_stream("hevc", rate=self.video_fps)
+        stream.time_base = Fraction(1, 1000 * 1000)  # Microseconds
+
+        start_time_video = time.time()
+
+        while self.video_record_status is True:
+            try:
+                data = device_queue.get().getData()  # np.array
+                packet = av.Packet(data)  # Create new packet with byte array
+
+                # Set frame timestamp
+                packet.pts = int((time.time() - start_time_video) * 1000 * 1000)
+
+                output_container.mux_one(packet)  # Mux the Packet into container
+            except Exception as e:
+                self.get_logger().error('Error in video recording: %s' % e)
+
+        output_container.close()
+        oakd_device.close()
+
+    def get_pubsub_params_request(self) -> str:
+
+        while not self.get_pubsub_parameter_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn('Pubsub parameter service not available, waiting again...')
+        # Make request to get pubsub parameters with IPFS path
+
+        request_ipfs = GetParameters.Request()
+        request_ipfs.names = ['ipfs_dir_path']
+        future_ipfs = self.get_pubsub_parameter_client.call_async(request_ipfs)
+
+        while future_ipfs.result() is None:
+            pass
+
+        return str(future_ipfs.result().values[0].string_value)
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
 
-    executor = MultiThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=4)
 
     with JohnnyLabNavigator() as johnny_lab_navigator:
         try:
