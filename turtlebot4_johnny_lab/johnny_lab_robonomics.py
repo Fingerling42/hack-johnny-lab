@@ -102,6 +102,11 @@ class JohnnyLabRobonomics(BasicRobonomicsHandler):
         rws_users_list = self.get_rws_users_request()
 
         transaction_hash = self.send_datalog_request(archive_file_name, encrypt_recipient_addresses=rws_users_list)
+
+        while transaction_hash == '':
+            self.get_logger().warn('Datalog sending failed, trying again')
+            transaction_hash = self.send_datalog_request(archive_file_name, encrypt_recipient_addresses=rws_users_list)
+
         self.get_logger().info('Datalog is sent: %s' % str(transaction_hash))
 
     def change_navigator_state_request(self,

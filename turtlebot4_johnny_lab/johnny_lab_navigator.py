@@ -13,13 +13,8 @@ from fractions import Fraction
 
 import rclpy
 from rclpy.action import ActionClient
-from rclpy.lifecycle import Node, LifecycleState, Publisher, State, TransitionCallbackReturn
-from rclpy.node import Subscription
+from rclpy.lifecycle import Node, LifecycleState, State, TransitionCallbackReturn
 from rclpy import Future
-
-from tf2_ros import TransformException
-from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
 
 from typing_extensions import Self, Any, Optional, List, Dict
 from io import TextIOWrapper
@@ -37,6 +32,7 @@ from irobot_create_msgs.msg import DockStatus
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import String
+from geometry_msgs.msg import Twist
 
 from rclpy.qos import qos_profile_sensor_data, qos_profile_system_default
 
@@ -74,11 +70,11 @@ class JohnnyLabNavigator(Node):
         try:
             self.initial_pose = self.get_pose_stamped(
                 navigator_params_dict['init']['position'],
-                navigator_params_dict['init']['rotation'])
+                360 - navigator_params_dict['init']['rotation'])
 
             self.initial_pose_back = self.get_pose_stamped(
                 navigator_params_dict['init']['position'],
-                0.0)
+                360 - (180 - navigator_params_dict['init']['rotation']))
         except Exception as e:
             self.get_logger().error('Error: %s' % str(e))
 
@@ -88,10 +84,12 @@ class JohnnyLabNavigator(Node):
             try:
                 pose = self.get_pose_stamped(
                     navigator_params_dict['points'][point]['position'],
-                    navigator_params_dict['points'][point]['rotation'])
+                    360 - navigator_params_dict['points'][point]['rotation'])
                 pose_dict = {
-                    'label':    str(point),
-                    'pose':     pose,
+                    'label':        str(point),
+                    'pose':         pose,
+                    'position_x':   navigator_params_dict['points'][point]['position'][0],
+                    'position_y':   navigator_params_dict['points'][point]['position'][1],
                 }
                 self.goal_poses.append(pose_dict)
             except Exception as e:
@@ -122,7 +120,7 @@ class JohnnyLabNavigator(Node):
         oakd_camera.setFps(self.video_fps)
 
         video_encoder = self.video_pipeline.create(dai.node.VideoEncoder)
-        video_encoder.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.H265_MAIN)
+        video_encoder.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.H264_MAIN)
         oakd_camera.video.link(video_encoder.input)
 
         xout = self.video_pipeline.create(dai.node.XLinkOut)
@@ -130,8 +128,6 @@ class JohnnyLabNavigator(Node):
         video_encoder.bitstream.link(xout.input)
 
         # Variable init
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.action_status_undock: Optional[int] = None
         self.action_status_dock: Optional[int] = None
@@ -188,6 +184,14 @@ class JohnnyLabNavigator(Node):
             callback_group=self.free_callback_group
         )
 
+        # Publisher for cmd_vel rotation
+        self.cmd_vel_rotate_publisher = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            10,
+            callback_group=self.free_callback_group
+        )
+
         self.get_logger().info('Navigator init is done')
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
@@ -214,18 +218,13 @@ class JohnnyLabNavigator(Node):
 
         os.remove(self.seeds_file_path)
 
-        # Split seed phrase into 2 words in pairs
+        # Split seed phrase into 12 words
         words_list = list(seed_phrase.split(' '))
-        two_words_list = []
 
-        for i in range(0, len(words_list), 2):
-            two_words = words_list[i] + ' ' + words_list[i + 1]
-            two_words_list.append(two_words)
-
-        # Add pairs of words to new list with goal poses dicts
+        # Add words to new list with goal poses dicts
         self.goal_random_poses_words = self.goal_poses.copy()
-        for i in range(0, len(two_words_list)):
-            self.goal_random_poses_words[i].update({'words': two_words_list[i]})
+        for i in range(0, len(words_list)):
+            self.goal_random_poses_words[i].update({'word': words_list[i]})
 
         # Randomize poses with words
         random.shuffle(self.goal_random_poses_words)
@@ -236,7 +235,6 @@ class JohnnyLabNavigator(Node):
                                          + current_time.strftime("%d-%m-%Y-%H-%M-%S") + '.zip')
 
         self.data_file = open(self.data_path, 'w')
-        self.data_file.write('[\n')
 
         self.get_logger().info('Configuring is done')
 
@@ -270,15 +268,29 @@ class JohnnyLabNavigator(Node):
 
         time.sleep(5)
 
+        # Calibration for localization
+        self.get_logger().info('Calibrating robot localization...')
+        for i in range(0, 5):
+            self.rotate_robot(z_rotation=-30)
+            time.sleep(3)
+
+        for i in range(0, 5):
+            self.rotate_robot(z_rotation=30)
+            time.sleep(3)
+
+        time.sleep(5)
+
         # Activate video
         self.video_record_status = True
         self.executor.create_task(self.video_routine)
         self.get_logger().info('Created video routine')
 
-        time.sleep(15)
+        time.sleep(10)
 
         try:
             point_num = 0
+            words = []
+            points = []
             for goal_pose in self.goal_random_poses_words:
 
                 self.send_goal_nav_to_pose(goal_pose['pose'])
@@ -289,39 +301,43 @@ class JohnnyLabNavigator(Node):
                         self.send_goal_nav_to_pose(goal_pose['pose'])
                     pass
 
-                # Getting pose from transform
-                try:
-                    coord_transform = self.tf_buffer.lookup_transform(
-                        'map',
-                        'base_link',
-                        rclpy.time.Time())
-
-                    robot_position_x = float(coord_transform.transform.translation.x)
-                    robot_position_y = float(coord_transform.transform.translation.y)
-
-                except TransformException:
-                    self.get_logger().warn('Could not make pose transform')
-                    robot_position_x = "NaN"
-                    robot_position_y = "NaN"
-
-                # Prepare dict with data and write in to file
-                data_json_dict = {
-                    'point_num': point_num,
-                    'two_words': goal_pose['words'],
-                    'robot_position_x': robot_position_x,
-                    'robot_position_y': robot_position_y,
-                }
-                json_data_string = json.dumps(data_json_dict, indent=4)
-                self.data_file.write(json_data_string + ',\n')
-
-                self.get_logger().info('Navigation to goal is done')
                 self.action_status_nav_to_pose = None
 
+                # Add word and coords to lists
+                words.append(goal_pose['word'])
+                points.append([self.goal_poses[point_num]['position_x'], self.goal_poses[point_num]['position_y']])
+
+                time.sleep(2)
+
+                self.get_logger().info('Calibrating...')
+
+                for i in range(0, 2):
+                    self.rotate_robot(z_rotation=-30)
+                    time.sleep(2)
+
+                for i in range(0, 2):
+                    self.rotate_robot(z_rotation=30)
+                    time.sleep(2)
+
+                for i in range(0, 2):
+                    self.rotate_robot(z_rotation=30)
+                    time.sleep(2)
+
+                for i in range(0, 2):
+                    self.rotate_robot(z_rotation=-30)
+                    time.sleep(2)
+
+                self.get_logger().info('Navigation to goal is done')
                 point_num += 1
 
-                time.sleep(5)
+            # Prepare dict with data and write in to file
+            data_json_dict = {
+                'points': points,
+                'words': words,
+            }
+            json_data_string = json.dumps(data_json_dict, indent=4)
+            self.data_file.write(json_data_string)
 
-            self.data_file.write(']')
         except Exception as e:
             self.get_logger().error('Error in active state: %s' % str(e))
 
@@ -336,6 +352,7 @@ class JohnnyLabNavigator(Node):
         self.get_logger().info('Navigator in deactivate state')
 
         # Return to initial point
+        self.action_status_nav_to_pose = None
         self.send_goal_nav_to_pose(self.initial_pose_back)
         while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
             if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
@@ -348,6 +365,15 @@ class JohnnyLabNavigator(Node):
         while self.action_status_dock != GoalStatus.STATUS_SUCCEEDED:
             if self.action_status_dock == GoalStatus.STATUS_ABORTED:
                 self.action_status_dock = None
+                self.action_status_nav_to_pose = None
+
+                self.send_goal_nav_to_pose(self.initial_pose_back)
+                while self.action_status_nav_to_pose != GoalStatus.STATUS_SUCCEEDED:
+                    if self.action_status_nav_to_pose == GoalStatus.STATUS_ABORTED:
+                        self.action_status_nav_to_pose = None
+                        self.send_goal_nav_to_pose(self.initial_pose_back)
+                    pass
+
                 self.send_goal_dock()
             pass
 
@@ -571,20 +597,23 @@ class JohnnyLabNavigator(Node):
         device_queue = oakd_device.getOutputQueue(name="enc", maxSize=30, blocking=True)
 
         output_container = av.open(self.video_path, 'w')
-        stream = output_container.add_stream("hevc", rate=self.video_fps)
+        stream = output_container.add_stream("h264", rate=self.video_fps)
         stream.time_base = Fraction(1, 1000 * 1000)  # Microseconds
 
-        start_time_video = time.time()
+        start_time_video = time.monotonic()
 
         while self.video_record_status is True:
             try:
-                data = device_queue.get().getData()  # np.array
-                packet = av.Packet(data)  # Create new packet with byte array
+                if device_queue.has():
+                    data = device_queue.get().getData()  # np.array
+                    packet = av.Packet(data)  # Create new packet with byte array
 
-                # Set frame timestamp
-                packet.pts = int((time.time() - start_time_video) * 1000 * 1000)
+                    # Set frame timestamp
+                    packet_timestamp = int((time.monotonic() - start_time_video) * 1000 * 1000)
+                    packet.dts = packet_timestamp
+                    packet.pts = packet_timestamp
 
-                output_container.mux_one(packet)  # Mux the Packet into container
+                    output_container.mux_one(packet)  # Mux the Packet into container
             except Exception as e:
                 self.get_logger().error('Error in video recording: %s' % e)
 
@@ -605,6 +634,22 @@ class JohnnyLabNavigator(Node):
             pass
 
         return str(future_ipfs.result().values[0].string_value)
+
+    def rotate_robot(self, z_rotation: float) -> None:
+        """
+        Method for publishing message to cmd_vel topic with rotation
+        :param z_rotation: Angular velocity in degree / sec
+        :return: None
+        """
+        msg = Twist()
+        msg.linear.x = 0.0
+        msg.linear.y = 0.0
+        msg.linear.z = 0.0
+
+        msg.angular.x = 0.0
+        msg.angular.y = 0.0
+        msg.angular.z = float(z_rotation * math.pi / 180)
+        self.cmd_vel_rotate_publisher.publish(msg)
 
 
 def main(args=None) -> None:
